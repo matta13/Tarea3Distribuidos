@@ -1,0 +1,103 @@
+services:
+  # 1. Base de Datos
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: mydatabase
+    ports:
+      - "5432:5432"
+    volumes:
+      # Asegúrate que tus archivos SQL se llamen así
+      - ./postgres/01schema.sql:/docker-entrypoint-initdb.d/create_schema.sql 
+      - ./postgres/02data.sql:/docker-entrypoint-initdb.d/data.sql 
+
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - claudio
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d mydatabase"] 
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      
+  # 2. Caché (NUEVO)
+  redis_cache:
+    image: redis:7-alpine
+    container_name: redis_cache
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - claudio
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # 3. Worker de IA (NUEVO)
+  gemini_svc:
+    build: ./gemini_service
+    container_name: gemini_svc
+    restart: unless-stopped
+    env_file:
+      - .env.gemini # <-- Su propio .env con la KEY
+    ports:
+      - "8001:8001" # Puerto interno del servicio gemini
+    networks:
+      - claudio
+    depends_on:
+      - postgres # (Aunque no la usa, es bueno para el orden de inicio)
+      - redis_cache
+
+  # 4. Orquestador (API) (MODIFICADO)
+  qa_api:
+    build: 
+      context: ./api
+      dockerfile: Dockerfile # Usando el Dockerfile de api 
+    container_name: qa_api
+    restart: unless-stopped
+    env_file:
+      - .env.api # <-- Su .env con las URLs de los otros servicios
+    volumes:
+      - ./api:/app
+      - ./.env.api:/app/.env.api # Monta el archivo de entorno 
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis_cache:
+        condition: service_healthy
+      gemini_svc: # <-- Nueva dependencia
+        condition: service_started # (O 'service_healthy' si le pones healthcheck)
+    networks:
+      - claudio
+    # Comando simplificado: ya no espera Kafka
+    command: ["sh", "-c", "while ! nc -z postgres 5432; do echo 'Waiting for DB...'; sleep 1; done; uvicorn main:app --host 0.0.0.0 --port 8000 --log-level debug"]
+
+  # 5. Cliente (Sin cambios, pero ajustado)
+  qa_client:
+    build: 
+      context: ./client
+    container_name: qa_client
+    restart: "no"
+    depends_on:
+      qa_api: # 
+        condition: service_started
+    stdin_open: true   
+    tty: true
+    networks:
+      - claudio
+    command: ["sh", "-c", "while ! nc -z qa_api 8000; do echo 'Waiting for API...'; sleep 1; done; python /app/client.py"] 
+
+networks:
+  claudio:
+    driver: bridge
+
+volumes:
+  postgres_data:
