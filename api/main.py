@@ -179,5 +179,4 @@ async def ask(solicitud: AskRequest):
 
 @app.get("/health")
 def health():
-    # (Aquí deberías añadir un ping a Postgres y Redis)
     return {"ok": True}
