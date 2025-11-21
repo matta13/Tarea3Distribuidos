@@ -1,5 +1,4 @@
 services:
-  # 1. Base de Datos
   postgres:
     image: postgres:15
     container_name: postgres
@@ -11,20 +10,17 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Asegúrate que tus archivos SQL se llamen así
-      - ./postgres/01schema.sql:/docker-entrypoint-initdb.d/create_schema.sql 
-      - ./postgres/02data.sql:/docker-entrypoint-initdb.d/data.sql 
-
+      - ./postgres/01schema.sql:/docker-entrypoint-initdb.d/create_schema.sql
+      - ./postgres/02data.sql:/docker-entrypoint-initdb.d/data.sql
       - postgres_data:/var/lib/postgresql/data
     networks:
       - claudio
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d mydatabase"] 
+      test: ["CMD-SHELL", "pg_isready -U admin -d mydatabase"]
       interval: 5s
       timeout: 3s
       retries: 15
-      
-  # 2. Caché (NUEVO)
+
   redis_cache:
     image: redis:7-alpine
     container_name: redis_cache
@@ -39,33 +35,31 @@ services:
       timeout: 3s
       retries: 15
 
-  # 3. Worker de IA (NUEVO)
   gemini_svc:
     build: ./gemini_service
     container_name: gemini_svc
     restart: unless-stopped
     env_file:
-      - .env.gemini # <-- Su propio .env con la KEY
+      - .env.gemini
     ports:
-      - "8001:8001" # Puerto interno del servicio gemini
+      - "8001:8001"
     networks:
       - claudio
     depends_on:
-      - postgres # (Aunque no la usa, es bueno para el orden de inicio)
+      - postgres
       - redis_cache
 
-  # 4. Orquestador (API) (MODIFICADO)
   qa_api:
-    build: 
+    build:
       context: ./api
-      dockerfile: Dockerfile # Usando el Dockerfile de api 
+      dockerfile: Dockerfile
     container_name: qa_api
     restart: unless-stopped
     env_file:
-      - .env.api # <-- Su .env con las URLs de los otros servicios
+      - .env.api
     volumes:
       - ./api:/app
-      - ./.env.api:/app/.env.api # Monta el archivo de entorno 
+      - ./.env.api:/app/.env.api
     ports:
       - "8000:8000"
     depends_on:
@@ -73,31 +67,123 @@ services:
         condition: service_healthy
       redis_cache:
         condition: service_healthy
-      gemini_svc: # <-- Nueva dependencia
-        condition: service_started # (O 'service_healthy' si le pones healthcheck)
+      gemini_svc:
+        condition: service_started
     networks:
       - claudio
-    # Comando simplificado: ya no espera Kafka
     command: ["sh", "-c", "while ! nc -z postgres 5432; do echo 'Waiting for DB...'; sleep 1; done; uvicorn main:app --host 0.0.0.0 --port 8000 --log-level debug"]
 
-  # 5. Cliente (Sin cambios, pero ajustado)
   qa_client:
-    build: 
+    build:
       context: ./client
     container_name: qa_client
     restart: "no"
     depends_on:
-      qa_api: # 
+      qa_api:
         condition: service_started
-    stdin_open: true   
+    stdin_open: true
     tty: true
     networks:
       - claudio
-    command: ["sh", "-c", "while ! nc -z qa_api 8000; do echo 'Waiting for API...'; sleep 1; done; python /app/client.py"] 
+    command: ["sh", "-c", "while ! nc -z qa_api 8000; do echo 'Waiting for API...'; sleep 1; done; python /app/client.py"]
+
+  hadoop-namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hadoop-namenode
+    hostname: hadoop-namenode
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=hadoop-cluster
+      - INIT_DAEMON_STEP=1
+    env_file:
+      - .env.hadoop
+    ports:
+      - "9870:9870" 
+    networks:
+      - claudio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://hadoop-namenode:9870/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  hadoop-datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hadoop-datanode
+    hostname: hadoop-datanode
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      - SERVICE_PRECONDITION=hadoop-namenode:9870
+    env_file:
+      - .env.hadoop
+    depends_on:
+      - hadoop-namenode
+    networks:
+      - claudio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://hadoop-datanode:9864/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  hadoop-resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
+    container_name: hadoop-resourcemanager
+    hostname: hadoop-resourcemanager
+    environment:
+      - SERVICE_PRECONDITION=hadoop-namenode:9870
+    env_file:
+      - .env.hadoop
+    depends_on:
+      - hadoop-namenode
+    ports:
+      - "8088:8088"
+    networks:
+      - claudio
+
+  pig:
+    build: ./pig
+    container_name: pig
+    hostname: pig
+    environment:
+      - SERVICE_PRECONDITION=hadoop-namenode:9870
+    env_file:
+      - .env.hadoop
+    depends_on:
+      - hadoop-namenode
+    volumes:
+      - ./pig_scripts:/pig_scripts  
+      - ./data_export:/data_export 
+    networks:
+      - claudio
+    stdin_open: true
+    tty: true
+
+  data_exporter:
+    build: ./data_exporter
+    container_name: data_exporter
+    restart: "no" 
+    env_file:
+      - .env.api 
+      - .env.hadoop
+    volumes:
+      - ./data_export:/app/data_export 
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hadoop-namenode:
+        condition: service_healthy
+    networks:
+      - claudio
+    command: ["sh", "-c", "python /app/export.py"]
+
+volumes:
+  postgres_data:
+  hadoop_namenode:
+  hadoop_datanode:
 
 networks:
   claudio:
     driver: bridge
-
-volumes:
-  postgres_data:
