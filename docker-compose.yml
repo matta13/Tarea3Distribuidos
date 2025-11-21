@@ -13,6 +13,7 @@ services:
       - ./postgres/01schema.sql:/docker-entrypoint-initdb.d/create_schema.sql
       - ./postgres/02data.sql:/docker-entrypoint-initdb.d/data.sql
       - postgres_data:/var/lib/postgresql/data
+      - ./datasets:/data_import
     networks:
       - claudio
     healthcheck:
@@ -187,3 +188,4 @@ volumes:
 networks:
   claudio:
     driver: bridge
+
